@@ -7,6 +7,8 @@
 
 #include <stdio.h>
 #include <unistd.h>
+#include <signal.h>
+#include <stdio.h>
 
 // MISC
 #define _POSIX_SOURCE 1 // POSIX compliant source
@@ -23,7 +25,30 @@
 const unsigned char SET_FRAME[5] = {FLAG_VALUE, A_TX_CMD, CTRL_SET, A_TX_CMD ^ CTRL_SET, FLAG_VALUE};
 const unsigned char UA_FRAME[5] = {FLAG_VALUE, A_TX_CMD, CTRL_UA, A_TX_CMD ^ CTRL_UA, FLAG_VALUE};
 
-//
+// Alarm stuff
+
+int alarmEnabled = FALSE;
+int alarmCount = 0;
+
+void alarmHandler(int signal)
+{
+    alarmEnabled = FALSE;
+    alarmCount++;
+
+    printf("Alarm #%d received\n", alarmCount);
+}
+
+// Receiver State Machine
+
+typedef enum
+{
+    STATE_START,
+    STATE_FLAG_RCV,
+    STATE_A_RCV,
+    STATE_C_RCV,
+    STATE_BCC_OK,
+    STATE_STOP
+} State;
 
 ////////////////////////////////////////////////
 // LLOPEN
@@ -36,11 +61,13 @@ int llOpenTx(LinkLayer llParameters)
         // ----------------------------------------------------
 
     */
-    volatile int STOP = FALSE;
-    int receivedBytes = 0;
-    int sentBytes = 0;
-    int frameIndex = 0;
-    unsigned char buf[5] = {0};
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+    if (sigaction(SIGALRM, &act, NULL) == -1)
+    {
+        perror("sigaction");
+        return -1;
+    }
 
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
     {
@@ -50,84 +77,91 @@ int llOpenTx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    /*
+    int receivedBytes = 0;
+    int sentBytes = 0;
+    alarmCount = 0;
+    alarmEnabled = FALSE;
 
-    // Create string to send
-    unsigned char buf[BUF_SIZE] = {0};
+    int connectionEstabilished = FALSE;
 
-    for (int i = 0; i < BUF_SIZE; i++)
+    while (alarmCount < llParameters.nRetransmissions && !connectionEstabilished)
     {
-        buf[i] = 'a' + i % 26;
-    }
-
-    // In non-canonical mode, '\n' does not end the writing.
-    // Test this condition by placing a '\n' in the middle of the buffer.
-    // The whole buffer must be sent even with the '\n'.
-    buf[5] = '\n'; */
-
-    int setBytes = writeBytesSerialPort(SET_FRAME, 5);
-    if (setBytes == 5)
-    {
-        sentBytes += setBytes;
-        printf("sent:");
-        for (int i = 0; i < 5; i++)
+        if (alarmEnabled == FALSE)
         {
-            printf(" 0x%02X", SET_FRAME[i]);
+            int setbytes = writeBytesSerialPort(SET_FRAME, 5);
+            if (setbytes == 5)
+            {
+                sentBytes += setbytes;
+                printf("sent: ");
+                for (int i = 0; i < 5; i++)
+                {
+                    printf(" 0x%02X", SET_FRAME[i]);
+                }
+                printf("\n");
+            }
+            else
+            {
+                printf("Could not send SET frame\n");
+                closeSerialPort();
+                return -1;
+            }
+
+            alarm(llParameters.timeout);
+            alarmEnabled = TRUE;
+        }
+
+        int frameIndex = 0;
+        unsigned char buf[5] = {0};
+        volatile int stopWaiting = FALSE;
+
+        printf("received:");
+        while (alarmEnabled == TRUE && !stopWaiting)
+        {
+            unsigned char byte;
+            int bytes = readByteSerialPort(&byte);
+            if (bytes > 0)
+            {
+                buf[frameIndex] = byte;
+                frameIndex++;
+                receivedBytes++;
+                printf(" 0x%02X", byte);
+            }
+            else if (bytes < 0)
+            {
+                break;
+            }
+            if (frameIndex == 5)
+            {
+                stopWaiting = TRUE;
+            }
         }
         printf("\n");
-    }
-    else
-    {
-        printf("Could not send SET frame\n");
-        closeSerialPort();
-        return -1;
+
+        if (stopWaiting &&
+            buf[0] == FLAG_VALUE &&
+            buf[1] == A_TX_CMD &&
+            buf[2] == CTRL_UA &&
+            buf[3] == (buf[1] ^ buf[2]) &&
+            buf[4] == FLAG_VALUE)
+        {
+            connectionEstabilished = TRUE;
+        }
     }
 
-    // Wait until all bytes have been written to the serial port
-    sleep(1);
-    printf("received:");
-    while (STOP == FALSE)
-    {
-        // Read one byte from serial port.
-        // NOTE: You must check how many bytes were actually read by reading the return value.
-        // In this example, we assume that the byte is always read, which may not be true.
-        unsigned char byte;
-        int bytes = readByteSerialPort(&byte);
-        if (bytes > 0)
-        {
-            buf[frameIndex] = byte;
-            frameIndex++;
-            receivedBytes++;
-            printf(" 0x%02X", byte);
-        }
-        else if (bytes < 0)
-        {
-            perror("readByteSerialPort");
-            break;
-        }
+    alarm(0);
 
-        if (frameIndex == 5)
-        {
-            STOP = TRUE;
-        }
-    }
-    printf("\n");
     int result = 0;
-    if (buf[0] == FLAG_VALUE &&
-        buf[1] == A_TX_CMD &&
-        buf[2] == CTRL_UA &&
-        buf[3] == (buf[1] ^ buf[2]) &&
-        buf[4] == FLAG_VALUE)
+    if (connectionEstabilished)
     {
-        printf("Connection Established\n");
+        printf("Connection Estabilished");
     }
     else
     {
-        printf("Connection failed: invalid UA frame\n");
+        printf("Connection failed: maximum retransmissions reached without valid UA");
         result = -1;
     }
-    printf("Total bytes sent: %d\n", sentBytes);
 
+    printf("Total bytes sent: %d\n", sentBytes);
     printf("Total bytes received: %d\n", receivedBytes);
 
     // Close serial port
@@ -157,61 +191,100 @@ int llOpenRx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    // Read from serial port until the 'z' char is received.
-
-    // NOTE: This while() cycle is a simple example showing how to read from the serial port.
-    // It must be changed in order to respect the specifications of the protocol indicated in the Lab guide.
-
-    // TODO: Save the received bytes in a buffer array and print it at the end of the program.
-    volatile int STOP = FALSE;
     int receivedBytes = 0;
     int sentBytes = 0;
-    int frameIndex = 0;
-    unsigned char buf[5] = {0};
+    State state = STATE_START;
 
+    unsigned char address_flag = 0;
+    unsigned char control_flag = 0;
     // Receive SET_FRAME
 
     printf("received:");
-    while (STOP == FALSE)
+    while (state != STATE_STOP)
     {
-        // Read one byte from serial port.
-        // NOTE: You must check how many bytes were actually read by reading the return value.
-        // In this example, we assume that the byte is always read, which may not be true.
         unsigned char byte;
         int bytes = readByteSerialPort(&byte);
         if (bytes > 0)
         {
-            if (frameIndex == 0 && byte != FLAG_VALUE)
-            {
-                receivedBytes++;
-                continue;
-            }
-            buf[frameIndex] = byte;
-            frameIndex++;
             receivedBytes++;
             printf(" 0x%02X", byte);
+            switch (state)
+            {
+            case STATE_START:
+                if (byte == FLAG_VALUE)
+                {
+                    state = STATE_FLAG_RCV;
+                }
+                break;
+            case STATE_FLAG_RCV:
+                if (byte == FLAG_VALUE)
+                {
+                    state = STATE_FLAG_RCV;
+                }
+                else if (byte == A_TX_CMD)
+                {
+                    address_flag = byte;
+                    state = STATE_A_RCV;
+                }
+                else
+                {
+                    state = STATE_START;
+                }
+                break;
+            case STATE_A_RCV:
+                if (byte == FLAG_VALUE)
+                {
+                    state = STATE_FLAG_RCV;
+                }
+                else if (byte == CTRL_SET)
+                {
+                    control_flag = byte;
+                    state = STATE_C_RCV;
+                }
+                else
+                {
+                    state = STATE_START;
+                }
+                break;
+            case STATE_C_RCV:
+                if (byte == (address_flag ^ control_flag))
+                {
+                    state = STATE_BCC_OK;
+                }
+                else if (byte == FLAG_VALUE)
+                {
+                    state = STATE_FLAG_RCV;
+                }
+                else
+                {
+                    state = STATE_START;
+                }
+                break;
+            case STATE_BCC_OK:
+                if (byte == FLAG_VALUE)
+                {
+                    state = STATE_STOP;
+                }
+                else
+                {
+                    state = STATE_START;
+                }
+                break;
+            default:
+                state = STATE_START;
+                break;
+            }
         }
         else if (bytes < 0)
         {
             perror("readByteSerialPort");
             break;
         }
-
-        if (frameIndex == 5)
-        {
-            STOP = TRUE;
-        }
     }
     printf("\n");
 
-    // If SET_FRAME is valid send UA_FLAG
-
     int result = 0;
-    if (buf[0] == FLAG_VALUE &&
-        buf[1] == A_TX_CMD &&
-        buf[2] == CTRL_SET &&
-        buf[3] == (buf[1] ^ buf[2]) &&
-        buf[4] == FLAG_VALUE)
+    if (state == STATE_STOP)
     {
         int uaBytes = writeBytesSerialPort(UA_FRAME, 5);
         if (uaBytes == 5)
@@ -223,7 +296,6 @@ int llOpenRx(LinkLayer llParameters)
                 printf(" 0x%02X", UA_FRAME[i]);
             }
             printf("\n");
-
             printf("Connection Established\n");
         }
         else
@@ -234,7 +306,7 @@ int llOpenRx(LinkLayer llParameters)
     }
     else
     {
-        printf("Connection failed: invalid SET frame\n");
+        printf("Connection failed: invalid frame sequence\n");
         result = -1;
     }
 
