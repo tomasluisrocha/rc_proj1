@@ -8,11 +8,13 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <signal.h>
-#include <stdio.h>
+#include <signal.h>
 
 // MISC
 #define _POSIX_SOURCE 1 // POSIX compliant source
 #define BUF_SIZE 256
+
+#define ANY_CTRL -1
 
 // Supervision Frame Stuff
 
@@ -21,9 +23,13 @@
 #define A_RX_CMD 0x01
 #define CTRL_SET 0x03
 #define CTRL_UA 0x07
+#define CTRL_DISC 0x0B
 
 const unsigned char SET_FRAME[5] = {FLAG_VALUE, A_TX_CMD, CTRL_SET, A_TX_CMD ^ CTRL_SET, FLAG_VALUE};
-const unsigned char UA_FRAME[5] = {FLAG_VALUE, A_TX_CMD, CTRL_UA, A_TX_CMD ^ CTRL_UA, FLAG_VALUE};
+const unsigned char UA_RX_FRAME[5] = {FLAG_VALUE, A_TX_CMD, CTRL_UA, A_TX_CMD ^ CTRL_UA, FLAG_VALUE};
+const unsigned char UA_TX_FRAME[5] = {FLAG_VALUE, A_RX_CMD, CTRL_UA, A_RX_CMD ^ CTRL_UA, FLAG_VALUE};
+const unsigned char DISC_TX_FRAME[5] = {FLAG_VALUE, A_TX_CMD, CTRL_DISC, A_TX_CMD ^ CTRL_DISC, FLAG_VALUE};
+const unsigned char DISC_RX_FRAME[5] = {FLAG_VALUE, A_RX_CMD, CTRL_DISC, A_RX_CMD ^ CTRL_DISC, FLAG_VALUE};
 
 // Alarm stuff
 
@@ -40,27 +46,95 @@ void alarmHandler(int signal)
 
 // Receiver State Machine
 
-typedef enum
+typedef enum State
 {
     STATE_START,
     STATE_FLAG_RCV,
     STATE_A_RCV,
     STATE_C_RCV,
-    STATE_BCC_OK,
     STATE_STOP
 } State;
+
+typedef struct Stats
+{
+    LinkLayer params;
+    int ns;
+    int bytesSent, bytesReceived;
+    int framesSent, framesReceived, rejReceived;
+} Stats;
+
+static Stats stats;
+
+// Write frame to serial and return number of written chars
+int writeFrame(const unsigned char *frame, int n)
+{
+    int w = writeBytesSerialPort(frame, n);
+    return w;
+}
+
+// Read supervision frame and compare it to addr/control bytes
+// Returns the control byte
+int readSupervision(unsigned char addr, int control, int timed)
+{
+    State state = STATE_START;
+    unsigned char received_ctrl = 0, bcc = 0, byte;
+    while (state != STATE_STOP && (!timed || alarmEnabled == TRUE))
+    {
+        int n = readByteSerialPort(&byte);
+        if (n < 0)
+            return -1;
+        if (n == 0)
+            continue;
+        stats.bytesReceived++;
+
+        switch (state)
+        {
+        case STATE_START: // State 0
+            if (byte == FLAG_VALUE)
+                state = STATE_FLAG_RCV;
+            break;
+        case STATE_FLAG_RCV: // State 1
+            if (byte == addr)
+                state = STATE_A_RCV;
+            else if (byte != FLAG_VALUE)
+                state = STATE_START;
+            break;
+        case STATE_A_RCV: // State 2
+            if (control == ANY_CTRL || byte == control)
+            {
+                received_ctrl = byte;
+                bcc = 0;
+                state = STATE_C_RCV;
+            }
+            else
+                state = STATE_START;
+            break;
+        case STATE_C_RCV: // State 3
+            if (byte != FLAG_VALUE)
+                bcc = byte;
+            else if (bcc == (addr ^ received_ctrl)) // State 4
+            {
+                state = STATE_STOP;
+                stats.framesReceived++;
+            }
+            else
+                state = STATE_START;
+            break;
+        default:
+            state = STATE_START;
+            break;
+        }
+    }
+    return state == STATE_STOP ? received_ctrl : -1;
+}
 
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
 int llOpenTx(LinkLayer llParameters)
 {
-    /*     // ----------------------------------------------------
-        // This example code shows how to open the serial port and send a string.
-        // TODO: Adapt and extend this code according to the specifications of the project.
-        // ----------------------------------------------------
+    stats = (Stats){.params = llParameters};
 
-    */
     struct sigaction act = {0};
     act.sa_handler = &alarmHandler;
     if (sigaction(SIGALRM, &act, NULL) == -1)
@@ -77,252 +151,77 @@ int llOpenTx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    int receivedBytes = 0;
-    int sentBytes = 0;
     alarmCount = 0;
     alarmEnabled = FALSE;
 
-    int connectionEstabilished = FALSE;
+    int connectionEstablished = FALSE;
 
-    while (alarmCount < llParameters.nRetransmissions && !connectionEstabilished)
+    while (alarmCount < llParameters.nRetransmissions && !connectionEstablished)
     {
         if (alarmEnabled == FALSE)
         {
-            int setbytes = writeBytesSerialPort(SET_FRAME, 5);
-            if (setbytes == 5)
-            {
-                sentBytes += setbytes;
-                printf("sent: ");
-                for (int i = 0; i < 5; i++)
-                {
-                    printf(" 0x%02X", SET_FRAME[i]);
-                }
-                printf("\n");
-            }
-            else
+            if (writeFrame(SET_FRAME, 5) != 5)
             {
                 printf("Could not send SET frame\n");
+                alarm(0);
                 closeSerialPort();
                 return -1;
             }
-
+            stats.framesSent++;
+            printf("Sent SET frame (attempt %d of %d)\n", alarmCount + 1, llParameters.nRetransmissions);
             alarm(llParameters.timeout);
             alarmEnabled = TRUE;
         }
 
-        int frameIndex = 0;
-        unsigned char buf[5] = {0};
-        volatile int stopWaiting = FALSE;
-
-        printf("received:");
-        while (alarmEnabled == TRUE && !stopWaiting)
+        int c = readSupervision(A_TX_CMD, CTRL_UA, TRUE);
+        if (c == CTRL_UA)
         {
-            unsigned char byte;
-            int bytes = readByteSerialPort(&byte);
-            if (bytes > 0)
-            {
-                buf[frameIndex] = byte;
-                frameIndex++;
-                receivedBytes++;
-                printf(" 0x%02X", byte);
-            }
-            else if (bytes < 0)
-            {
-                break;
-            }
-            if (frameIndex == 5)
-            {
-                stopWaiting = TRUE;
-            }
-        }
-        printf("\n");
-
-        if (stopWaiting &&
-            buf[0] == FLAG_VALUE &&
-            buf[1] == A_TX_CMD &&
-            buf[2] == CTRL_UA &&
-            buf[3] == (buf[1] ^ buf[2]) &&
-            buf[4] == FLAG_VALUE)
-        {
-            connectionEstabilished = TRUE;
+            printf("Received UA frame\n");
+            connectionEstablished = TRUE;
         }
     }
 
     alarm(0);
 
-    int result = 0;
-    if (connectionEstabilished)
+    if (!connectionEstablished)
     {
-        printf("Connection Estabilished");
-    }
-    else
-    {
-        printf("Connection failed: maximum retransmissions reached without valid UA");
-        result = -1;
-    }
-
-    printf("Total bytes sent: %d\n", sentBytes);
-    printf("Total bytes received: %d\n", receivedBytes);
-
-    // Close serial port
-    if (closeSerialPort() < 0)
-    {
-        perror("closeSerialPort");
+        printf("Connection failed: no valid UA received\n");
+        closeSerialPort();
         return -1;
     }
 
-    printf("Serial port %s closed\n", llParameters.serialPort);
-
-    return result;
+    return 0;
 }
 
 int llOpenRx(LinkLayer llParameters)
 {
-    // ----------------------------------------------------
-    // This example code shows how to open the serial port and receive a string.
-    // TODO: Adapt and extend this code according to the specifications of the project.
-    // ----------------------------------------------------
+    stats = (Stats){.params = llParameters};
 
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
     {
         perror("openSerialPort");
         return -1;
     }
-
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    int receivedBytes = 0;
-    int sentBytes = 0;
-    State state = STATE_START;
-
-    unsigned char address_flag = 0;
-    unsigned char control_flag = 0;
-    // Receive SET_FRAME
-
-    printf("received:");
-    while (state != STATE_STOP)
+    if (readSupervision(A_TX_CMD, CTRL_SET, FALSE) != CTRL_SET)
     {
-        unsigned char byte;
-        int bytes = readByteSerialPort(&byte);
-        if (bytes > 0)
-        {
-            receivedBytes++;
-            printf(" 0x%02X", byte);
-            switch (state)
-            {
-            case STATE_START:
-                if (byte == FLAG_VALUE)
-                {
-                    state = STATE_FLAG_RCV;
-                }
-                break;
-            case STATE_FLAG_RCV:
-                if (byte == FLAG_VALUE)
-                {
-                    state = STATE_FLAG_RCV;
-                }
-                else if (byte == A_TX_CMD)
-                {
-                    address_flag = byte;
-                    state = STATE_A_RCV;
-                }
-                else
-                {
-                    state = STATE_START;
-                }
-                break;
-            case STATE_A_RCV:
-                if (byte == FLAG_VALUE)
-                {
-                    state = STATE_FLAG_RCV;
-                }
-                else if (byte == CTRL_SET)
-                {
-                    control_flag = byte;
-                    state = STATE_C_RCV;
-                }
-                else
-                {
-                    state = STATE_START;
-                }
-                break;
-            case STATE_C_RCV:
-                if (byte == (address_flag ^ control_flag))
-                {
-                    state = STATE_BCC_OK;
-                }
-                else if (byte == FLAG_VALUE)
-                {
-                    state = STATE_FLAG_RCV;
-                }
-                else
-                {
-                    state = STATE_START;
-                }
-                break;
-            case STATE_BCC_OK:
-                if (byte == FLAG_VALUE)
-                {
-                    state = STATE_STOP;
-                }
-                else
-                {
-                    state = STATE_START;
-                }
-                break;
-            default:
-                state = STATE_START;
-                break;
-            }
-        }
-        else if (bytes < 0)
-        {
-            perror("readByteSerialPort");
-            break;
-        }
-    }
-    printf("\n");
-
-    int result = 0;
-    if (state == STATE_STOP)
-    {
-        int uaBytes = writeBytesSerialPort(UA_FRAME, 5);
-        if (uaBytes == 5)
-        {
-            sentBytes += uaBytes;
-            printf("sent:");
-            for (int i = 0; i < 5; i++)
-            {
-                printf(" 0x%02X", UA_FRAME[i]);
-            }
-            printf("\n");
-            printf("Connection Established\n");
-        }
-        else
-        {
-            printf("Connection failed: could not send UA frame\n");
-            result = -1;
-        }
-    }
-    else
-    {
-        printf("Connection failed: invalid frame sequence\n");
-        result = -1;
-    }
-
-    printf("Total bytes sent: %d\n", sentBytes);
-    printf("Total bytes received: %d\n", receivedBytes);
-
-    // Close serial port
-    if (closeSerialPort() < 0)
-    {
-        perror("closeSerialPort");
+        printf("Connection failed: could not read SET frame\n");
+        closeSerialPort();
         return -1;
     }
+    printf("Received SET frame\n");
 
-    printf("Serial port %s closed\n", llParameters.serialPort);
+    if (writeFrame(UA_RX_FRAME, 5) != 5)
+    {
+        printf("Connection failed: could not send UA frame\n");
+        closeSerialPort();
+        return -1;
+    }
+    stats.framesSent++;
 
-    return result;
+    printf("Connection established\n");
+    return 0;
 }
 
 ////////////////////////////////////////////////
@@ -350,14 +249,94 @@ int llReceive(unsigned char *packet)
 ////////////////////////////////////////////////
 int llCloseTx()
 {
-    // TODO: Implement this function
+    alarmCount = 0;
+    alarmEnabled = FALSE;
+    int discReceived = FALSE;
 
-    return 0;
+    // Send DISC frame
+    while (alarmCount < stats.params.nRetransmissions && !discReceived)
+    {
+        if (alarmEnabled == FALSE)
+        {
+            if (writeFrame(DISC_TX_FRAME, 5) != 5)
+            {
+                printf("Could not send DISC frame\n");
+                alarm(0);
+                closeSerialPort();
+                return -1;
+            }
+            stats.framesSent++;
+            alarm(stats.params.timeout);
+            alarmEnabled = TRUE;
+        }
+
+        // Receive DISC frame
+        int c = readSupervision(A_RX_CMD, CTRL_DISC, TRUE);
+        if (c == CTRL_DISC)
+        {
+            discReceived = TRUE;
+            printf("Sent DISC frame to Rx");
+        }
+    }
+    alarm(0);
+
+    // Write UA frame
+    if (discReceived)
+    {
+        if (writeFrame(UA_TX_FRAME, 5) == 5)
+        {
+            stats.framesSent++;
+        }
+        printf("Termination handshake complete.\n");
+    }
+    else
+    {
+        printf("Termination handshake timed-out.\n");
+    }
+    if (closeSerialPort() < 0)
+    {
+        perror("closeSerialPort");
+        return -1;
+    }
+    printf("Transmitter serial port closed successfully.\n");
+    return discReceived ? 0 : -1;
 }
 
 int llCloseRx()
 {
-    // TODO: Implement this function
 
+    // Receive DISC frame
+    if (readSupervision(A_TX_CMD, CTRL_DISC, FALSE) != CTRL_DISC)
+    {
+        printf("Error reading DISC frame from Tx\n");
+        closeSerialPort();
+        return -1;
+    }
+    printf("Received DISC frame from Tx\n");
+
+    // Send DISC frame
+    if (writeFrame(DISC_RX_FRAME, 5) != 5)
+    {
+        printf("Could not send DISC frame from Rx\n");
+        closeSerialPort();
+        return -1;
+    }
+    stats.framesSent++;
+    printf("Sent DISC frame back to Tx\n");
+
+    // Await UA
+    if (readSupervision(A_RX_CMD, CTRL_UA, FALSE) != CTRL_UA)
+    {
+        printf("Error reading final UA frame from Tx\n");
+        closeSerialPort();
+        return -1;
+    }
+    printf("Received UA frame from Tx. Termination handshake complete.\n");
+    if (closeSerialPort() < 0)
+    {
+        perror("closeSerialPort");
+        return -1;
+    }
+    printf("Receiver serial port closed successfully.\n");
     return 0;
 }
