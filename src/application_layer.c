@@ -29,6 +29,40 @@ int buildControlPacket(unsigned char *packet, unsigned char controlType, long fi
     return idx;
 }
 
+int parseControlPacket(const unsigned char *packet, int size, long *fileSize, char *name, int nameMax)
+{
+    if (packet == NULL || fileSize == NULL || name == NULL || size < 1 || nameMax <= 0)
+        return -1;
+
+    int idx = 1;
+    while (idx + 2 <= size)
+    {
+        if (size - idx < 2)
+            return -1;
+
+        unsigned char type = packet[idx++];
+        unsigned char length = packet[idx++];
+        if (length > size - idx)
+            return -1;
+
+        if (type == 0)
+        {
+            if (length > sizeof(*fileSize))
+                return -1;
+            *fileSize = 0;
+            memcpy(fileSize, &packet[idx], length);
+        }
+        else if (type == 1 && L < nameMax) 
+        {
+            memcpy(name, &packet[idx], L);
+            name[L] = '\0';
+        }
+        idx += L;
+    }
+
+    return 0;
+}
+
 int buildDataPacket(unsigned char* packet,const unsigned char* data, int bytesRead)
 {
     int idx = 0;
